@@ -428,6 +428,8 @@ module_param_named(
 static int fg_restart;
 static bool fg_sram_dump;
 
+#define FG_RATE_LIM_MS (5 * MSEC_PER_SEC)
+
 /* All getters HERE */
 
 #define VOLTAGE_15BIT_MASK	GENMASK(14, 0)
@@ -910,9 +912,14 @@ static int fg_get_prop_capacity(struct fg_chip *chip, int *val)
 		return 0;
 	}
 
-	if (chip->battery_missing || !chip->soc_reporting_ready) {
+	if (chip->battery_missing) {
 		*val = BATT_MISS_SOC;
 		return 0;
+	}
+
+	if (!chip->soc_reporting_ready) {
+		*val = BATT_MISS_SOC;
+		return -EBUSY;
 	}
 
 	if (is_batt_empty(chip)) {
@@ -1883,7 +1890,9 @@ static int fg_charge_full_update(struct fg_chip *chip)
 		msoc, bsoc, chip->health, chip->charge_status,
 		chip->charge_full);
 	if (chip->charge_done && !chip->charge_full) {
-		if (msoc >= 99 && chip->health == POWER_SUPPLY_HEALTH_GOOD) {
+		if (msoc >= 99 && (chip->health == POWER_SUPPLY_HEALTH_GOOD
+				|| chip->health == POWER_SUPPLY_HEALTH_COOL
+				|| chip->health == POWER_SUPPLY_HEALTH_WARM)) {
 			fg_dbg(chip, FG_STATUS, "Setting charge_full to true\n");
 			chip->charge_full = true;
 			/*
@@ -3993,7 +4002,15 @@ static int fg_psy_get_property(struct power_supply *psy,
 				       union power_supply_propval *pval)
 {
 	struct fg_chip *chip = power_supply_get_drvdata(psy);
+	struct fg_saved_data *sd = chip->saved_data + psp;
 	int rc = 0;
+
+	if (sd->last_req_expires) {
+		if (time_before(jiffies, sd->last_req_expires)) {
+			*pval = sd->val;
+			return 0;
+		}
+	}
 
 	switch (psp) {
 	case POWER_SUPPLY_PROP_CAPACITY:
@@ -4121,6 +4138,9 @@ static int fg_psy_get_property(struct power_supply *psy,
 
 	if (rc < 0)
 		return -ENODATA;
+
+	sd->val = *pval;
+	sd->last_req_expires = jiffies + msecs_to_jiffies(FG_RATE_LIM_MS);
 
 	return 0;
 }
